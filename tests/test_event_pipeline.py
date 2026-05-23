@@ -8,7 +8,7 @@ Tests the event-based ingestion path end to end:
 
 Requires a running Redis and PostgreSQL with the schema loaded. Skips
 cleanly if either is unavailable, so the redaction unit tests can still
-run in a bare environment.
+run in a bare environment..
 
 Run with:  pytest tests/test_event_pipeline.py -v
 
