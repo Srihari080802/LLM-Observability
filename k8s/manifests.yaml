@@ -1,0 +1,420 @@
+# ============================================================
+# k8s/manifests.yaml -- Kubernetes deployment for the whole stack
+#
+# Designed for a SELF-HOSTED single-node cluster (minikube / kind).
+# See k8s/deploy.sh for the one-script deploy. Summary:
+#
+#   minikube start
+#   eval $(minikube docker-env)            # build into minikube's docker
+#   docker build -t llm-obs-ingestion:latest -f services/ingestion-api/Dockerfile .
+#   docker build -t llm-obs-chat:latest      -f services/chat-api/Dockerfile .
+#   docker build -t llm-obs-frontend:latest  -f frontend/Dockerfile .
+#   kubectl apply -f k8s/manifests.yaml
+#
+# Because images are built straight into minikube's docker daemon, the
+# Deployments use imagePullPolicy: Never -- no registry needed.
+#
+# Resources: Namespace, Secret, ConfigMap, schema ConfigMap, Postgres
+# (Deployment+Service+PVC), Redis (Deployment+Service), ingestion-api
+# (2 replicas), chat-api (2 replicas), frontend, and an Ingress.
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-obs
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-secrets
+  namespace: llm-obs
+type: Opaque
+stringData:
+  # For a real Gemini deploy, set this (or use PROVIDER=fake and ignore).
+  GEMINI_API_KEY: ""
+  OPENAI_API_KEY: ""
+  DB_PASSWORD: "llm"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-config
+  namespace: llm-obs
+data:
+  DB_HOST: "postgres"
+  DB_USER: "llm"
+  DB_NAME: "llm_obs"
+  DB_PORT: "5432"
+  REDIS_URL: "redis://redis:6379"
+  LOG_TRANSPORT: "events"
+  INGESTION_URL: "http://ingestion-api:8001"
+  # PROVIDER=fake lets the cluster run with no API key. Set to 'google'
+  # (and fill the Secret) for real Gemini.
+  PROVIDER: "fake"
+  MODEL: ""
+  CONTEXT_WINDOW: "10"
+---
+# The database schema, embedded so Postgres auto-loads it on first boot.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-schema
+  namespace: llm-obs
+data:
+  schema.sql: |
+    -- ============================================================
+    -- LLM Observability — Database Schema
+    -- ============================================================
+    -- Three tables, each with a deliberately distinct purpose:
+    --
+    --   conversations  -> session-level state (powers list/resume/cancel)
+    --   messages       -> chat content, one row per turn (rebuilds context)
+    --   inference_logs -> operational telemetry, one row per LLM API call
+    --
+    -- KEY DESIGN DECISION
+    -- -------------------
+    -- messages and inference_logs are SEPARATE tables even though they are
+    -- created together. Reasons:
+    --   1. Different read patterns. messages are read sequentially to rebuild
+    --      conversation context. inference_logs are aggregated (AVG, COUNT,
+    --      percentiles) for dashboards. Mixing them would bloat the hot
+    --      chat-read path with columns it never needs.
+    --   2. Different lifecycle. Chat content may need long retention for the
+    --      user; operational logs can be aggregated and aged out.
+    --   3. Different write owners. messages are written by the chat-api.
+    --      inference_logs are written by the ingestion-api. Separation keeps
+    --      ownership clean.
+    -- ============================================================
+    
+    CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- for gen_random_uuid()
+    
+    -- ------------------------------------------------------------
+    -- conversations: one row per chat session
+    -- ------------------------------------------------------------
+    CREATE TABLE IF NOT EXISTS conversations (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        title       TEXT NOT NULL DEFAULT 'New conversation',
+        -- status drives the UI's cancel/resume feature.
+        --   active    -> normal, can receive messages
+        --   cancelled -> user cancelled; frontend hides input
+        status      TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'cancelled')),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    
+    -- ------------------------------------------------------------
+    -- messages: one row per turn in a conversation
+    -- ------------------------------------------------------------
+    CREATE TABLE IF NOT EXISTS messages (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+        content         TEXT NOT NULL,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    
+    -- Composite index: the core query is
+    --   "give me messages for conversation X, oldest first"
+    -- A single index on (conversation_id, created_at) serves both the
+    -- filter and the sort, so Postgres never has to sort separately.
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation
+        ON messages (conversation_id, created_at);
+    
+    -- ------------------------------------------------------------
+    -- inference_logs: one row per LLM API call (the observability data)
+    -- ------------------------------------------------------------
+    CREATE TABLE IF NOT EXISTS inference_logs (
+        id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        conversation_id    UUID REFERENCES conversations(id) ON DELETE CASCADE,
+        -- message_id may be NULL when a call fails before a message is stored.
+        message_id         UUID REFERENCES messages(id) ON DELETE SET NULL,
+    
+        -- --- identity of the call ---
+        provider           TEXT NOT NULL,            -- 'google', 'openai', ...
+        model              TEXT NOT NULL,            -- 'gemini-2.0-flash', ...
+    
+        -- --- performance ---
+        latency_ms         INTEGER,                  -- wall-clock of the API call
+        prompt_tokens      INTEGER,
+        completion_tokens  INTEGER,
+        total_tokens       INTEGER,
+    
+        -- --- outcome ---
+        status             TEXT NOT NULL             -- 'success' | 'error'
+                           CHECK (status IN ('success', 'error')),
+        error_message      TEXT,                     -- populated when status='error'
+    
+        -- --- previews (truncated + PII-redacted by the ingestion service) ---
+        -- We store PREVIEWS, not full payloads, to keep this table lean and
+        -- to reduce exposure of sensitive content. Full content lives in
+        -- the messages table.
+        input_preview      TEXT,
+        output_preview     TEXT,
+    
+        -- --- timestamps ---
+        request_started_at TIMESTAMPTZ,              -- when the SDK began the call
+        created_at         TIMESTAMPTZ NOT NULL DEFAULT now()  -- when ingested
+    );
+    
+    -- Dashboards query logs by time window, so index created_at.
+    CREATE INDEX IF NOT EXISTS idx_logs_created_at
+        ON inference_logs (created_at);
+    
+    -- Dashboards also slice by provider/model and filter errors.
+    CREATE INDEX IF NOT EXISTS idx_logs_provider_model
+        ON inference_logs (provider, model);
+    CREATE INDEX IF NOT EXISTS idx_logs_status
+        ON inference_logs (status);
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pgdata
+  namespace: llm-obs
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: llm-obs
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { configMapKeyRef: { name: llm-config, key: DB_USER } }
+            - name: POSTGRES_DB
+              valueFrom: { configMapKeyRef: { name: llm-config, key: DB_NAME } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: llm-secrets, key: DB_PASSWORD } }
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+            - name: schema
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "llm", "-d", "llm_obs"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim: { claimName: pgdata }
+        - name: schema
+          configMap: { name: db-schema }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: llm-obs
+spec:
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# Redis -- the event broker (Redis Streams).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: llm-obs
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: llm-obs
+spec:
+  selector: { app: redis }
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-api
+  namespace: llm-obs
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: ingestion-api }
+  template:
+    metadata:
+      labels: { app: ingestion-api }
+    spec:
+      containers:
+        - name: ingestion-api
+          image: llm-obs-ingestion:latest
+          imagePullPolicy: Never        # image built into minikube's docker
+          ports:
+            - containerPort: 8001
+          envFrom:
+            - configMapRef: { name: llm-config }
+          env:
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: llm-secrets, key: DB_PASSWORD } }
+            - name: HOSTNAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8001 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-api
+  namespace: llm-obs
+spec:
+  selector: { app: ingestion-api }
+  ports:
+    - port: 8001
+      targetPort: 8001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-api
+  namespace: llm-obs
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: chat-api }
+  template:
+    metadata:
+      labels: { app: chat-api }
+    spec:
+      containers:
+        - name: chat-api
+          image: llm-obs-chat:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef: { name: llm-config }
+          env:
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: llm-secrets, key: DB_PASSWORD } }
+            - name: GEMINI_API_KEY
+              valueFrom: { secretKeyRef: { name: llm-secrets, key: GEMINI_API_KEY } }
+            - name: OPENAI_API_KEY
+              valueFrom: { secretKeyRef: { name: llm-secrets, key: OPENAI_API_KEY } }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-api
+  namespace: llm-obs
+spec:
+  selector: { app: chat-api }
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: llm-obs
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: frontend }
+  template:
+    metadata:
+      labels: { app: frontend }
+    spec:
+      containers:
+        - name: frontend
+          image: llm-obs-frontend:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: llm-obs
+spec:
+  type: NodePort
+  selector: { app: frontend }
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080      # reachable at minikube-ip:30080
+---
+# Ingress -- single entry point. Needs an ingress controller
+# (minikube addons enable ingress).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-obs-ingress
+  namespace: llm-obs
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: llm-obs.local
+      http:
+        paths:
+          - path: /chat
+            pathType: Prefix
+            backend:
+              service: { name: chat-api, port: { number: 8000 } }
+          - path: /ingest
+            pathType: Prefix
+            backend:
+              service: { name: ingestion-api, port: { number: 8001 } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: frontend, port: { number: 80 } }

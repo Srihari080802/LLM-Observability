@@ -1,0 +1,115 @@
+# ============================================================
+# docker-compose.yml — one-command setup for the whole stack
+#
+#   docker compose up --build
+#
+# Brings up FIVE services:
+#   postgres        the database (schema auto-loaded on first boot)
+#   redis           the event broker (Redis Streams)
+#   ingestion-api   consumes log events from Redis, stores them, serves metrics
+#   chat-api        the chatbot backend (uses the SDK)
+#   frontend        nginx serving the single-file React UI
+#
+# EVENT-BASED FLOW
+#   chat-api's SDK --publish--> redis stream --consume--> ingestion-api --> postgres
+# The SDK and ingestion-api never talk directly; they only share redis.
+#
+# Service-to-service traffic uses Docker's internal DNS (the service
+# names below). The browser talks to chat-api / ingestion-api over the
+# published localhost ports.
+# ============================================================
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: llm
+      POSTGRES_PASSWORD: llm
+      POSTGRES_DB: llm_obs
+    # schema.sql in /docker-entrypoint-initdb.d is run automatically
+    # the first time the data volume is empty.
+    volumes:
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llm -d llm_obs"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # The event broker. Redis Streams is the log-event transport between
+  # the SDK (producer) and the ingestion service (consumer).
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  ingestion-api:
+    build:
+      context: .
+      dockerfile: services/ingestion-api/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_USER: llm
+      DB_PASSWORD: llm
+      DB_NAME: llm_obs
+      REDIS_URL: redis://redis:6379
+      # 'events' runs the Redis Stream consumer; 'http' would use POST /ingest.
+      LOG_TRANSPORT: ${LOG_TRANSPORT:-events}
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  chat-api:
+    build:
+      context: .
+      dockerfile: services/chat-api/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_USER: llm
+      DB_PASSWORD: llm
+      DB_NAME: llm_obs
+      REDIS_URL: redis://redis:6379
+      LOG_TRANSPORT: ${LOG_TRANSPORT:-events}
+      # Internal DNS name of the ingestion service (used only if
+      # LOG_TRANSPORT=http).
+      INGESTION_URL: http://ingestion-api:8001
+      # --- provider configuration ---
+      PROVIDER: ${PROVIDER:-fake}
+      MODEL: ${MODEL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CONTEXT_WINDOW: ${CONTEXT_WINDOW:-10}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ingestion-api:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - chat-api
+      - ingestion-api
+
+volumes:
+  pgdata:

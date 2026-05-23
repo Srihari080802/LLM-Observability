@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LLM Observability Console</title>
+
+<!-- React + Babel via CDN: no build step, the whole UI is this one file.
+     Tradeoff: in-browser Babel is slower to boot than a built bundle, but
+     for a demo/learning project the zero-setup win is worth it. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --border: #2a3140;
+    --text: #d6dde6;
+    --muted: #7f8b9c;
+    --accent: #46d3a8;
+    --user: #2d6cdf;
+    --error: #e5534b;
+    --ok: #3fb950;
+    --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    height: 100vh; overflow: hidden;
+  }
+  #root { height: 100vh; }
+  .app { display: flex; height: 100vh; }
+
+  /* ---- sidebar ---- */
+  .sidebar {
+    width: 280px; background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+  }
+  .brand {
+    padding: 18px 16px; border-bottom: 1px solid var(--border);
+    font-weight: 700; font-size: 15px; letter-spacing: .3px;
+  }
+  .brand span { color: var(--accent); }
+  .new-btn {
+    margin: 12px; padding: 10px; background: var(--accent);
+    color: #06241c; border: none; border-radius: 6px;
+    font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  .new-btn:hover { filter: brightness(1.1); }
+  .convo-list { flex: 1; overflow-y: auto; padding: 4px 8px; }
+  .convo {
+    padding: 9px 10px; border-radius: 6px; cursor: pointer;
+    margin-bottom: 3px; font-size: 13px;
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .convo:hover { background: var(--panel-2); }
+  .convo.active { background: var(--panel-2); outline: 1px solid var(--border); }
+  .convo-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .convo-meta { font-size: 11px; color: var(--muted); display: flex; gap: 6px; }
+  .tag {
+    font-size: 10px; padding: 1px 6px; border-radius: 3px;
+    text-transform: uppercase; letter-spacing: .4px;
+  }
+  .tag.cancelled { background: #3a1e1e; color: var(--error); }
+  .tag.active { background: #16301f; color: var(--ok); }
+  .nav { display: flex; border-top: 1px solid var(--border); }
+  .nav button {
+    flex: 1; padding: 11px; background: none; border: none;
+    color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 600;
+  }
+  .nav button.active { color: var(--accent); background: var(--panel-2); }
+
+  /* ---- main ---- */
+  .main { flex: 1; display: flex; flex-direction: column; }
+  .header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .header h2 { font-size: 14px; font-weight: 600; }
+  .header .actions { display: flex; gap: 8px; }
+  .btn-sm {
+    padding: 6px 12px; font-size: 12px; border-radius: 5px;
+    border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); cursor: pointer;
+  }
+  .btn-sm:hover { background: var(--panel-2); }
+  .btn-sm.danger { color: var(--error); border-color: #4a2525; }
+  .btn-sm.go { color: var(--ok); border-color: #244a2f; }
+
+  /* ---- messages ---- */
+  .messages { flex: 1; overflow-y: auto; padding: 20px; }
+  .msg { margin-bottom: 16px; display: flex; gap: 10px; max-width: 760px; }
+  .msg.user { margin-left: auto; flex-direction: row-reverse; }
+  .avatar {
+    width: 28px; height: 28px; border-radius: 5px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700;
+  }
+  .avatar.user { background: var(--user); color: #fff; }
+  .avatar.assistant { background: var(--accent); color: #06241c; }
+  .bubble {
+    padding: 10px 13px; border-radius: 8px; font-size: 14px;
+    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user .bubble { background: var(--user); color: #fff; }
+  .msg.assistant .bubble { background: var(--panel-2); }
+  .empty { color: var(--muted); text-align: center; margin-top: 80px; font-size: 14px; }
+
+  /* ---- composer ---- */
+  .composer { padding: 14px 20px; border-top: 1px solid var(--border); }
+  .composer-row { display: flex; gap: 10px; }
+  .composer textarea {
+    flex: 1; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 7px; color: var(--text); padding: 10px 12px;
+    font-size: 14px; resize: none; font-family: inherit; height: 44px;
+  }
+  .composer textarea:focus { outline: 1px solid var(--accent); }
+  .send {
+    padding: 0 20px; background: var(--accent); color: #06241c;
+    border: none; border-radius: 7px; font-weight: 600; cursor: pointer;
+  }
+  .send:disabled { opacity: .4; cursor: not-allowed; }
+  .composer-opts { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .composer-opts label { cursor: pointer; }
+  .locked {
+    padding: 14px 20px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 13px; text-align: center;
+  }
+
+  /* ---- dashboard ---- */
+  .dash { flex: 1; overflow-y: auto; padding: 20px; }
+  .cards { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px;
+  }
+  .card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .card .value { font-size: 24px; font-weight: 700; margin-top: 6px; }
+  .card .value.err { color: var(--error); }
+  .section-title { margin: 22px 0 10px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+  .status-pill { padding: 2px 7px; border-radius: 3px; font-size: 11px; }
+  .status-pill.success { background: #16301f; color: var(--ok); }
+  .status-pill.error { background: #3a1e1e; color: var(--error); }
+  .bars { display: flex; align-items: flex-end; gap: 3px; height: 90px; padding: 8px 0; }
+  .bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 2px; }
+  .bar.has-err { background: var(--error); }
+  .spinner { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:.3} 50%{opacity:1} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// API base URLs. In Docker these are reachable on localhost via the
+// published ports. Override by editing here if you host elsewhere.
+const CHAT_API = window.CHAT_API || "http://localhost:8000";
+const INGEST_API = window.INGEST_API || "http://localhost:8001";
+
+// ============================================================
+// API helper functions — thin fetch wrappers
+// ============================================================
+const api = {
+  listConversations: () =>
+    fetch(`${CHAT_API}/conversations`).then(r => r.json()),
+  createConversation: () =>
+    fetch(`${CHAT_API}/conversations`, { method: "POST",
+      headers: {"Content-Type":"application/json"}, body: "{}" }).then(r => r.json()),
+  getConversation: (id) =>
+    fetch(`${CHAT_API}/conversations/${id}`).then(r => r.json()),
+  cancel: (id) =>
+    fetch(`${CHAT_API}/conversations/${id}/cancel`, { method: "POST" }).then(r => r.json()),
+  resume: (id) =>
+    fetch(`${CHAT_API}/conversations/${id}/resume`, { method: "POST" }).then(r => r.json()),
+  metricsSummary: () => fetch(`${INGEST_API}/metrics/summary`).then(r => r.json()),
+  metricsByProvider: () => fetch(`${INGEST_API}/metrics/by_provider`).then(r => r.json()),
+  timeseries: () => fetch(`${INGEST_API}/metrics/timeseries`).then(r => r.json()),
+  recentLogs: () => fetch(`${INGEST_API}/logs/recent?limit=30`).then(r => r.json()),
+};
+
+// ============================================================
+// Chat view
+// ============================================================
+function ChatView({ conversation, onConversationChanged }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [streaming, setStreaming] = useState(true);
+  const scrollRef = useRef(null);
+
+  // Load full history whenever the selected conversation changes.
+  // This is the "RESUME a conversation" feature: switching to any
+  // conversation re-fetches its messages from the server.
+  useEffect(() => {
+    if (!conversation) { setMessages([]); return; }
+    api.getConversation(conversation.id).then(d => setMessages(d.messages || []));
+  }, [conversation && conversation.id]);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages]);
+
+  const isCancelled = conversation && conversation.status === "cancelled";
+
+  const send = useCallback(async () => {
+    if (!input.trim() || busy || !conversation) return;
+    const text = input.trim();
+    setInput("");
+    setBusy(true);
+    setMessages(m => [...m, { role: "user", content: text, id: "tmp-u" }]);
+
+    try {
+      if (streaming) {
+        // --- streaming path: read Server-Sent Events ---
+        setMessages(m => [...m, { role: "assistant", content: "", id: "tmp-a" }]);
+        const resp = await fetch(
+          `${CHAT_API}/conversations/${conversation.id}/chat/stream`,
+          { method: "POST", headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ message: text }) });
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === "chunk") {
+              setMessages(m => {
+                const copy = [...m];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  content: copy[copy.length - 1].content + evt.text };
+                return copy;
+              });
+            }
+          }
+        }
+      } else {
+        // --- non-streaming path ---
+        const resp = await fetch(
+          `${CHAT_API}/conversations/${conversation.id}/chat`,
+          { method: "POST", headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ message: text }) });
+        const data = await resp.json();
+        setMessages(m => [...m, { role: "assistant",
+          content: data.reply || `(error: ${data.detail || "unknown"})`,
+          id: data.message_id }]);
+      }
+    } catch (e) {
+      setMessages(m => [...m, { role: "assistant",
+        content: `(request failed: ${e.message})`, id: "err" }]);
+    } finally {
+      setBusy(false);
+      onConversationChanged();
+    }
+  }, [input, busy, conversation, streaming, onConversationChanged]);
+
+  if (!conversation) {
+    return <div className="main"><div className="empty">
+      Select or create a conversation to begin.</div></div>;
+  }
+
+  return (
+    <div className="main">
+      <div className="header">
+        <h2>{conversation.title}</h2>
+        <div className="actions">
+          {isCancelled
+            ? <button className="btn-sm go" onClick={async () => {
+                await api.resume(conversation.id); onConversationChanged(); }}>
+                ▶ Resume</button>
+            : <button className="btn-sm danger" onClick={async () => {
+                await api.cancel(conversation.id); onConversationChanged(); }}>
+                ■ Cancel conversation</button>}
+        </div>
+      </div>
+
+      <div className="messages" ref={scrollRef}>
+        {messages.length === 0 &&
+          <div className="empty">No messages yet — say hello.</div>}
+        {messages.map((m, i) => (
+          <div key={m.id || i} className={`msg ${m.role}`}>
+            <div className={`avatar ${m.role}`}>
+              {m.role === "user" ? "YOU" : "AI"}</div>
+            <div className="bubble">
+              {m.content || (busy && i === messages.length - 1
+                ? <span className="spinner"></span> : "")}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {isCancelled
+        ? <div className="locked">
+            This conversation is cancelled. Resume it to continue chatting.</div>
+        : <div className="composer">
+            <div className="composer-row">
+              <textarea value={input} placeholder="Type a message…"
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+                }} />
+              <button className="send" onClick={send} disabled={busy}>
+                {busy ? "…" : "Send"}</button>
+            </div>
+            <div className="composer-opts">
+              <label>
+                <input type="checkbox" checked={streaming}
+                  onChange={e => setStreaming(e.target.checked)} /> Stream response
+              </label>
+            </div>
+          </div>}
+    </div>
+  );
+}
+
+// ============================================================
+// Dashboard view — reads aggregates from the ingestion API
+// ============================================================
+function Dashboard() {
+  const [summary, setSummary] = useState(null);
+  const [byProvider, setByProvider] = useState([]);
+  const [series, setSeries] = useState([]);
+  const [logs, setLogs] = useState([]);
+
+  const refresh = useCallback(() => {
+    api.metricsSummary().then(setSummary).catch(()=>{});
+    api.metricsByProvider().then(setByProvider).catch(()=>{});
+    api.timeseries().then(setSeries).catch(()=>{});
+    api.recentLogs().then(setLogs).catch(()=>{});
+  }, []);
+
+  // Auto-refresh every 5s so the dashboard feels near real-time.
+  useEffect(() => { refresh(); const t = setInterval(refresh, 5000);
+    return () => clearInterval(t); }, [refresh]);
+
+  const maxCalls = Math.max(1, ...series.map(s => s.calls));
+
+  return (
+    <div className="main">
+      <div className="header"><h2>Observability Dashboard</h2>
+        <button className="btn-sm" onClick={refresh}>↻ Refresh</button></div>
+      <div className="dash">
+        <div className="cards">
+          <div className="card"><div className="label">Total Calls</div>
+            <div className="value">{summary ? summary.total_calls : "—"}</div></div>
+          <div className="card"><div className="label">Error Rate</div>
+            <div className="value err">
+              {summary ? (summary.error_rate*100).toFixed(1)+"%" : "—"}</div></div>
+          <div className="card"><div className="label">Avg Latency</div>
+            <div className="value">{summary ? summary.avg_latency_ms+"ms" : "—"}</div></div>
+          <div className="card"><div className="label">p95 Latency</div>
+            <div className="value">{summary ? summary.p95_latency_ms+"ms" : "—"}</div></div>
+        </div>
+
+        <div className="section-title">Throughput — last hour (calls / min)</div>
+        <div className="card">
+          <div className="bars">
+            {series.length === 0 && <span className="mono"
+              style={{color:"var(--muted)"}}>no data yet</span>}
+            {series.map((s, i) => (
+              <div key={i}
+                className={"bar" + (s.errors > 0 ? " has-err" : "")}
+                style={{ height: (s.calls / maxCalls * 100) + "%" }}
+                title={`${s.minute}\n${s.calls} calls, ${s.errors} errors, `
+                  + `${s.avg_latency_ms}ms avg`}></div>
+            ))}
+          </div>
+        </div>
+
+        <div className="section-title">By Provider / Model</div>
+        <div className="card">
+          <table><thead><tr>
+            <th>Provider</th><th>Model</th><th>Calls</th>
+            <th>Errors</th><th>Avg Latency</th><th>Tokens</th>
+          </tr></thead><tbody>
+            {byProvider.map((r, i) => (
+              <tr key={i}>
+                <td>{r.provider}</td><td className="mono">{r.model}</td>
+                <td>{r.calls}</td><td>{r.errors}</td>
+                <td>{r.avg_latency_ms}ms</td><td>{r.total_tokens}</td>
+              </tr>
+            ))}
+            {byProvider.length === 0 && <tr><td colSpan="6"
+              style={{color:"var(--muted)"}}>no data yet</td></tr>}
+          </tbody></table>
+        </div>
+
+        <div className="section-title">Recent Inference Logs</div>
+        <div className="card">
+          <table><thead><tr>
+            <th>Time</th><th>Provider</th><th>Status</th>
+            <th>Latency</th><th>Tokens</th><th>Output preview</th>
+          </tr></thead><tbody>
+            {logs.map((l) => (
+              <tr key={l.id}>
+                <td className="mono">{new Date(l.created_at).toLocaleTimeString()}</td>
+                <td>{l.provider}</td>
+                <td><span className={`status-pill ${l.status}`}>{l.status}</span></td>
+                <td>{l.latency_ms}ms</td><td>{l.total_tokens || "—"}</td>
+                <td className="mono" style={{maxWidth:"260px",overflow:"hidden",
+                  textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                  {l.status === "error" ? l.error_message : l.output_preview}</td>
+              </tr>
+            ))}
+            {logs.length === 0 && <tr><td colSpan="6"
+              style={{color:"var(--muted)"}}>no logs yet</td></tr>}
+          </tbody></table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Root app — sidebar + view switching
+// ============================================================
+function App() {
+  const [conversations, setConversations] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [view, setView] = useState("chat");  // 'chat' | 'dashboard'
+
+  const loadConversations = useCallback(() => {
+    api.listConversations().then(list => {
+      setConversations(list);
+      // auto-select the newest if nothing is selected
+      setActiveId(cur => cur || (list[0] && list[0].id) || null);
+    }).catch(()=>{});
+  }, []);
+
+  useEffect(() => { loadConversations(); }, [loadConversations]);
+
+  const active = conversations.find(c => c.id === activeId) || null;
+
+  const newConversation = async () => {
+    const c = await api.createConversation();
+    await loadConversations();
+    setActiveId(c.id);
+    setView("chat");
+  };
+
+  return (
+    <div className="app">
+      <div className="sidebar">
+        <div className="brand">LLM<span>·</span>Observability</div>
+        <button className="new-btn" onClick={newConversation}>+ New conversation</button>
+        <div className="convo-list">
+          {conversations.map(c => (
+            <div key={c.id}
+              className={"convo" + (c.id === activeId ? " active" : "")}
+              onClick={() => { setActiveId(c.id); setView("chat"); }}>
+              <div className="convo-title">{c.title}</div>
+              <div className="convo-meta">
+                <span className={`tag ${c.status}`}>{c.status}</span>
+                <span>{c.message_count} msgs</span>
+              </div>
+            </div>
+          ))}
+          {conversations.length === 0 &&
+            <div style={{color:"var(--muted)",fontSize:"12px",padding:"10px"}}>
+              No conversations yet.</div>}
+        </div>
+        <div className="nav">
+          <button className={view==="chat"?"active":""}
+            onClick={()=>setView("chat")}>Chat</button>
+          <button className={view==="dashboard"?"active":""}
+            onClick={()=>setView("dashboard")}>Dashboard</button>
+        </div>
+      </div>
+
+      {view === "chat"
+        ? <ChatView conversation={active}
+            onConversationChanged={loadConversations} />
+        : <Dashboard />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
