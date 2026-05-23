@@ -94,6 +94,12 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+# --- ADD THIS ROUTE RIGHT HERE ---
+@app.get("/health")
+async def health_check():
+    """Kubernetes liveness and readiness health probe target."""
+    return {"status": "ok"}
+# ---------------------------------
 
 # ----------------------------------------------------------------------
 # request/response models

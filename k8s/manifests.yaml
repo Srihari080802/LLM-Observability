@@ -50,8 +50,8 @@ data:
   INGESTION_URL: "http://ingestion-api:8001"
   # PROVIDER=fake lets the cluster run with no API key. Set to 'google'
   # (and fill the Secret) for real Gemini.
-  PROVIDER: "fake"
-  MODEL: ""
+  PROVIDER: "google"
+  MODEL: "gemini-2.5-flash"
   CONTEXT_WINDOW: "10"
 ---
 # The database schema, embedded so Postgres auto-loads it on first boot.
@@ -272,7 +272,7 @@ metadata:
   name: ingestion-api
   namespace: llm-obs
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels: { app: ingestion-api }
   template:
@@ -317,7 +317,7 @@ metadata:
   name: chat-api
   namespace: llm-obs
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels: { app: chat-api }
   template:
